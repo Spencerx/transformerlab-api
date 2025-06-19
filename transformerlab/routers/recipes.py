@@ -3,6 +3,7 @@ from transformerlab.shared import galleries
 import transformerlab.db as db
 from transformerlab.models import model_helper
 import json
+from transformerlab.routers.experiment import workflows
 
 router = APIRouter(prefix="/recipes", tags=["recipes"])
 
@@ -15,7 +16,7 @@ async def list_recipes():
 
 
 @router.get("/{id}")
-async def get_recipe_by_id(id: int):
+async def get_recipe_by_id(id: str):
     """Fetch a recipe by its ID from the experiment recipe gallery."""
     recipes_gallery = galleries.get_exp_recipe_gallery()
     for recipe in recipes_gallery:
@@ -25,7 +26,7 @@ async def get_recipe_by_id(id: int):
 
 
 @router.get("/{id}/check_dependencies")
-async def check_recipe_dependencies(id: int):
+async def check_recipe_dependencies(id: str):
     """Check if the dependencies for a recipe are installed for a given environment."""
     # Get the recipe
     recipes_gallery = galleries.get_exp_recipe_gallery()
@@ -80,7 +81,6 @@ async def _install_recipe_dependencies_job(job_id, id):
             await db.job_update_status(job_id, "FAILED", error_msg=f"Recipe with id {id} not found.")
             return
         if len(recipe.get("dependencies", [])) == 0:
-            await db.job_update_job_data_insert_key_value(job_id, "results", [])
             await db.job_update_status(job_id, "COMPLETE")
             return
 
@@ -132,7 +132,7 @@ async def _install_recipe_dependencies_job(job_id, id):
 
 
 @router.get("/{id}/install_dependencies")
-async def bg_install_recipe_dependencies(id: int, background_tasks: BackgroundTasks):
+async def bg_install_recipe_dependencies(id: str, background_tasks: BackgroundTasks):
     """Install dependencies for a recipe in the background and track progress."""
 
     job_id = await db.job_create(
@@ -162,9 +162,8 @@ async def get_install_job_status(job_id: int):
 
 
 @router.post("/{id}/create_experiment")
-async def create_experiment_for_recipe(id: int, experiment_name: str):
+async def create_experiment_for_recipe(id: str, experiment_name: str):
     """Create a new experiment with the given name and blank config, and install workflow dependencies."""
-    from transformerlab.routers import workflows as workflows_router
     from transformerlab.routers.experiment import experiment as experiment_router
 
     # Check if experiment already exists
@@ -172,7 +171,7 @@ async def create_experiment_for_recipe(id: int, experiment_name: str):
     if existing:
         return {"status": "error", "message": f"Experiment '{experiment_name}' already exists.", "data": {}}
     # Create experiment with blank config
-    experiment_id = await db.experiment_create(name=experiment_name, config="{}")
+    experiment_id = await db.experiment_create(name=experiment_name, config={})
 
     # Get the recipe
     recipes_gallery = galleries.get_exp_recipe_gallery()
@@ -186,9 +185,7 @@ async def create_experiment_for_recipe(id: int, experiment_name: str):
         try:
             # Use the experiment router's save_file_contents function to create the Notes file
             notes_result = await experiment_router.experiment_save_file_contents(
-                id=experiment_id,
-                filename="readme.md",
-                file_contents=recipe.get("notes")
+                id=experiment_id, filename="readme.md", file_contents=recipe.get("notes")
             )
         except Exception:
             notes_result = {"error": "Failed to create Notes file."}
@@ -234,10 +231,10 @@ async def create_experiment_for_recipe(id: int, experiment_name: str):
             result = {"name": dep_name, "action": "install_workflow"}
             if workflow_config is not None:
                 try:
-                    workflow_id = await workflows_router.workflow_create(
+                    workflow_id = await workflows.workflow_create(
                         name=dep_name,
                         config=json.dumps(workflow_config),
-                        experiment_id=experiment_id,
+                        experimentId=experiment_id,
                     )
                     result["status"] = f"success: {workflow_id}"
                 except Exception as e:
@@ -246,16 +243,41 @@ async def create_experiment_for_recipe(id: int, experiment_name: str):
                 result["status"] = "error: config not provided"
             workflow_results.append(result)
 
+    # Process documents - download ZIP files
+    document_results = []
+    for doc in recipe.get("documents", []):
+        url = doc.get("url")
+        
+        result = {"url": url, "action": "download_documents"}
+        try:
+            from transformerlab.routers.experiment import documents as documents_router
+            
+            # Download and extract the ZIP file
+            download_result = await documents_router.document_download_zip(
+                experimentId=experiment_id,
+                data={"url": url}
+            )
+            
+            result["status"] = download_result.get("status", "unknown")
+            result["extracted_files"] = download_result.get("extracted_files", [])
+            result["total_files"] = download_result.get("total_files", 0)
+            result["extraction_path"] = download_result.get("extraction_path", "")
+            
+        except Exception:
+            result["status"] = "error: failed to download documents"
+        
+        document_results.append(result)
+
     # Process tasks and create tasks in database
     task_results = []
     tasks = recipe.get("tasks", [])
-    
+
     # Extract dataset from dependencies (assuming only one dataset)
     dataset_name = ""
     dataset_deps = [dep for dep in recipe.get("dependencies", []) if dep.get("type") == "dataset"]
     if dataset_deps:
         dataset_name = dataset_deps[0].get("name", "")
-    
+
     for i, task in enumerate(tasks):
         task_type = task.get("task_type")
         if task_type in ["TRAIN", "EVAL", "GENERATE"]:
@@ -268,50 +290,54 @@ async def create_experiment_for_recipe(id: int, experiment_name: str):
                 for key, value in parsed_config.items():
                     if key != "script_parameters" and isinstance(value, (list, dict)):
                         parsed_config[key] = json.dumps(value)
-                
+
                 # Convert list/dict values inside script_parameters to strings
                 if "script_parameters" in parsed_config and isinstance(parsed_config["script_parameters"], dict):
                     for param_key, param_value in parsed_config["script_parameters"].items():
                         if isinstance(param_value, (list, dict)):
                             parsed_config["script_parameters"][param_key] = json.dumps(param_value)
 
-                # Generate simple task name that helps user follow order of tasks
-                task_name = f"Task_{i+1}"
-                
+                # Extract task name from recipe
+                task_name = task.get("name")
+
                 # Create inputs JSON (what the task needs as inputs)
                 inputs = {
                     "model_name": parsed_config.get("model_name", ""),
                     "model_architecture": parsed_config.get("model_architecture", ""),
-                    "dataset_name": dataset_name  # Using dataset from dependencies
+                    "dataset_name": dataset_name,  # Using dataset from dependencies
                 }
 
                 # For EVAL tasks, add evaluation specific inputs
                 if task_type == "EVAL":
-                    inputs.update({
-                        "tasks": parsed_config.get("tasks", ""),
-                        "limit": parsed_config.get("limit", ""),
-                        "run_name": parsed_config.get("run_name", "")
-                    })
+                    inputs.update(
+                        {
+                            "tasks": parsed_config.get("tasks", ""),
+                            "limit": parsed_config.get("limit", ""),
+                            "run_name": parsed_config.get("run_name", ""),
+                        }
+                    )
                 # For GENERATE tasks, add generation specific inputs
                 elif task_type == "GENERATE":
-                    inputs.update({
-                        "num_goldens": parsed_config.get("num_goldens", ""),
-                        "scenario": parsed_config.get("scenario", ""),
-                        "task": parsed_config.get("task", ""),
-                        "run_name": parsed_config.get("run_name", "")
-                    })
-                
+                    inputs.update(
+                        {
+                            "num_goldens": parsed_config.get("num_goldens", ""),
+                            "scenario": parsed_config.get("scenario", ""),
+                            "task": parsed_config.get("task", ""),
+                            "run_name": parsed_config.get("run_name", ""),
+                        }
+                    )
+
                 # Create outputs JSON (what the task produces)
                 outputs = {}
 
                 if task_type == "EVAL":
-                    outputs["eval_results"] = {}
+                    outputs["eval_results"] = "{}"
                 elif task_type == "GENERATE":
-                    outputs["generated_outputs"] = []
+                    outputs["generated_outputs"] = "[]"
 
                 # Get plugin name
                 plugin_name = parsed_config.get("plugin_name", "")
-                
+
                 # Create task in database
                 await db.add_task(
                     name=task_name,
@@ -320,25 +346,62 @@ async def create_experiment_for_recipe(id: int, experiment_name: str):
                     config=json.dumps(parsed_config),
                     plugin=plugin_name,
                     outputs=json.dumps(outputs),
-                    experiment_id=experiment_id
+                    experiment_id=experiment_id,
                 )
-                
-                task_results.append({
-                    "task_index": i+1,
-                    "task_name": task_name,
-                    "action": "create_task",
-                    "status": "success",
-                    "task_type": task_type,
-                    "dataset_used": dataset_name,
-                    "plugin": plugin_name
-                })
-                
+
+                task_results.append(
+                    {
+                        "task_index": i + 1,
+                        "task_name": task_name,
+                        "action": "create_task",
+                        "status": "success",
+                        "task_type": task_type,
+                        "dataset_used": dataset_name,
+                        "plugin": plugin_name,
+                    }
+                )
+
             except Exception:
-                task_results.append({
-                    "task_index": i+1,
-                    "action": "create_task", 
-                    "status": f"error: Failed to create {task_type.lower()} task."
-                })
+                task_results.append(
+                    {
+                        "task_index": i + 1,
+                        "action": "create_task",
+                        "status": f"error: Failed to create {task_type.lower()} task.",
+                    }
+                )
+
+    # Process workflows and create workflows in database
+    workflow_creation_results = []
+    recipe_workflows = recipe.get("workflows", [])
+
+    for workflow_def in recipe_workflows:
+        try:
+            workflow_name = workflow_def.get("name", "")
+            workflow_config = workflow_def.get("config", {"nodes": []})
+
+            # Create workflow in database using the workflow_create function
+            workflow_id = await workflows.workflow_create(
+                name=workflow_name, config=json.dumps(workflow_config), experimentId=experiment_id
+            )
+
+            # Log the workflow creation results
+            workflow_creation_results.append(
+                {
+                    "workflow_name": workflow_name,
+                    "action": "create_workflow",
+                    "status": "success",
+                    "workflow_id": workflow_id,
+                }
+            )
+
+        except Exception:
+            workflow_creation_results.append(
+                {
+                    "workflow_name": workflow_def.get("name", "Unknown"),
+                    "action": "create_workflow",
+                    "status": "error: Failed to create workflow.",
+                }
+            )
 
     return {
         "status": "success",
@@ -348,7 +411,9 @@ async def create_experiment_for_recipe(id: int, experiment_name: str):
             "name": experiment_name,
             "model_set_result": model_set_result,
             "workflow_results": workflow_results,
+            "document_results": document_results,
             "task_results": task_results,
+            "workflow_creation_results": workflow_creation_results,
             "notes_result": notes_result,
         },
     }

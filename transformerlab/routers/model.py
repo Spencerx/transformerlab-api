@@ -7,9 +7,11 @@ from typing import Annotated
 import transformerlab.db as db
 from fastapi import APIRouter, Body
 from fastchat.model.model_adapter import get_conversation_template
-from huggingface_hub import snapshot_download, create_repo, upload_folder, HfApi
+from huggingface_hub import snapshot_download, create_repo, upload_folder, HfApi, list_repo_tree
 from huggingface_hub import ModelCard, ModelCardData
-from huggingface_hub.utils import HfHubHTTPError, GatedRepoError
+from huggingface_hub.utils import HfHubHTTPError, GatedRepoError, EntryNotFoundError
+from transformers import AutoTokenizer
+
 import os
 from pathlib import Path
 import logging
@@ -538,8 +540,7 @@ on the model's Huggingface page."
         return {"status": "unauthorized", "message": error_msg}
     except Exception as e:
         error_msg = f"{type(e).__name__}: {e}"
-        # Log the detailed error message
-        print(error_msg)  # Replace with appropriate logging mechanism
+        print(error_msg)
         if job_id:
             await db.job_update_status(job_id, "FAILED", error_msg)
         return {"status": "error", "message": "An internal error has occurred."}
@@ -549,6 +550,89 @@ on the model's Huggingface page."
         if job_id:
             await db.job_update_status(job_id, "FAILED", error_msg)
         return {"status": "error", "message": error_msg}
+
+        # Check if this is a GGUF repository that requires file selection
+    if model_details.get("requires_file_selection", False):
+        available_files = model_details.get("available_gguf_files", [])
+        return {
+            "status": "requires_file_selection",
+            "message": "This is a GGUF repository with multiple files. Please specify which file to download.",
+            "model_id": model,
+            "available_files": available_files,
+            "model_details": model_details,
+        }
+
+    # --- Stable Diffusion detection and allow_patterns logic ---
+    # If the model is a Stable Diffusion model, set allow_patterns for SD files
+    sd_patterns = [
+        "*.ckpt",
+        "*.safetensors",
+        "*.pt",
+        "*.bin",
+        "config.json",
+        "model_index.json",
+        "vocab.json",
+        "merges.txt",
+        "tokenizer.json",
+        "*.yaml",
+        "*.yml",
+    ]
+    is_sd = False
+    # Heuristic: check tags or config for 'stable-diffusion' or 'diffusers' or common SD files
+    tags = model_details.get("tags", [])
+    if any("stable-diffusion" in t or "diffusers" in t for t in tags):
+        is_sd = True
+    # Or check for model_index.json or config.json with SD structure
+    files = model_details.get("siblings", [])
+    if any(f.get("rfilename", "").endswith("model_index.json") for f in files):
+        is_sd = True
+    # If detected, set allow_patterns
+    if is_sd:
+        model_details["allow_patterns"] = sd_patterns
+
+    return await download_huggingface_model(model, model_details, job_id)
+
+
+@router.get(path="/model/download_gguf_file")
+async def download_gguf_file_from_repo(model: str, filename: str, job_id: int | None = None):
+    """Download a specific GGUF file from a GGUF repository"""
+
+    # First get the model details to validate this is a GGUF repo
+    try:
+        model_details = await huggingfacemodel.get_model_details_from_huggingface(model)
+    except Exception as e:
+        error_msg = f"Error accessing model repository: {type(e).__name__}: {e}"
+        if job_id:
+            await db.job_update_status(job_id, "FAILED", error_msg)
+        return {"status": "error", "message": error_msg}
+
+    if model_details is None:
+        error_msg = f"Error reading config for model with ID {model}"
+        if job_id:
+            await db.job_update_status(job_id, "FAILED", error_msg)
+        return {"status": "error", "message": error_msg}
+
+    # Validate the requested filename exists in the repository
+    available_files = model_details.get("available_gguf_files", [])
+    if filename not in available_files:
+        error_msg = f"File '{filename}' not found in repository. Available files: {available_files}"
+        if job_id:
+            await db.job_update_status(job_id, "FAILED", error_msg)
+        return {"status": "error", "message": error_msg}
+
+    # Update model details for specific file download
+    model_details["huggingface_filename"] = filename
+    model_details["name"] = f"{model_details['name']} ({filename})"
+
+    # Calculate size of specific file
+    try:
+        repo_tree = list_repo_tree(model, recursive=True)
+        for file in repo_tree:
+            if hasattr(file, "path") and file.path == filename:
+                model_details["size_of_model_in_mb"] = file.size / (1024 * 1024)
+                break
+    except Exception:
+        pass  # Use existing size if we can't get specific file size
 
     return await download_huggingface_model(model, model_details, job_id)
 
@@ -650,11 +734,17 @@ async def model_gets_pefts(
 ):
     workspace_dir = dirs.WORKSPACE_DIR
     model_id = secure_filename(model_id)
-    adaptors_dir = f"{workspace_dir}/adaptors/{model_id}"
-    adaptors = []
-    if os.path.exists(adaptors_dir):
-        adaptors = os.listdir(adaptors_dir)
-    return adaptors
+    adaptors_dir = os.path.join(workspace_dir, "adaptors", model_id)
+
+    if not os.path.exists(adaptors_dir):
+        return []
+
+    adaptors = [
+        name
+        for name in os.listdir(adaptors_dir)
+        if os.path.isdir(os.path.join(adaptors_dir, name)) and not name.startswith(".")
+    ]
+    return sorted(adaptors)
 
 
 @router.get("/model/delete_peft")
@@ -672,6 +762,124 @@ async def model_delete_peft(model_id: str, peft: str):
     shutil.rmtree(peft_path)
 
     return {"message": "success"}
+
+
+@router.post("/model/install_peft")
+async def install_peft(peft: str, model_id: str, job_id: int | None = None):
+    api = HfApi()
+
+    try:
+        local_file = snapshot_download(model_id, local_files_only=True)
+        base_config = {}
+        for config_name in ["config.json", "model_index.json"]:
+            config_path = os.path.join(local_file, config_name)
+            if os.path.exists(config_path):
+                with open(config_path, "r") as f:
+                    base_config = json.load(f)
+                break
+    except Exception as e:
+        logging.warning(f"Failed to load {model_id} config: {e}")
+        return {
+            "status": "error",
+            "message": "Failed to load local base model config",
+            "adapter_id": peft,
+            "check_status": {"error": "not found"},
+        }
+
+    try:
+        adapter_info = api.model_info(peft)
+        card_data = adapter_info.cardData or {}
+        adapter_config = adapter_info.config or {}
+        adapter_base_model = card_data.get("base_model") or adapter_config.get("base_model") or ""
+
+        model_name_part = model_id.split("/")[-1].lower()
+        adapter_base_model_lower = adapter_base_model.split("/")[-1].lower()
+
+        # Initialize status tracking
+        check_status = {}
+
+        # Base model name check
+        if model_name_part in adapter_base_model_lower:
+            check_status["base_model_name"] = "success"
+        else:
+            check_status["base_model_name"] = "fail"
+
+        # Field checks
+        def compare_field(a_cfg, b_cfg, key, fallback_keys=None):
+            if key in a_cfg and key in b_cfg:
+                return a_cfg[key] == b_cfg[key]
+            if fallback_keys:
+                for fk in fallback_keys:
+                    if fk in a_cfg and fk in b_cfg:
+                        return a_cfg[fk] == b_cfg[fk]
+            return None
+
+        for field in ["architectures", "model_type"]:
+            match = compare_field(adapter_config, base_config, field, fallback_keys=["_class_name"])
+            if match is True:
+                check_status[f"{field}_status"] = "success"
+            elif match is False:
+                check_status[f"{field}_status"] = "fail"
+            else:
+                check_status[f"{field}_status"] = "unknown"
+
+    except Exception as e:
+        logging.error(f"[ERROR] Failed to fetch adapter info for '{peft}: {e}'")
+        return {
+            "status": "error",
+            "message": "adapter not found",
+            "adapter_id": peft,
+            "check_status": {"error": "not found"},
+        }
+
+    try:
+        model_details = await huggingfacemodel.get_model_details_from_huggingface(peft)
+    except EntryNotFoundError:
+        logging.warning(f"Adaptor {peft} does not have a config.json. Proceeding without details.")
+        model_details = {}
+    except GatedRepoError:
+        error_msg = f"{peft} is a gated adapter. Please log in and accept the terms on the adapter's Hugging Face page."
+        logging.error(error_msg)
+        return {
+            "status": "unauthorized",
+            "message": "This is a gated adapter. Please log in and accept the terms on the adapter's Hugging Face page.",
+        }
+    except Exception as e:
+        error_msg = f"{type(e).__name__}: {e}"
+        logging.error(error_msg)
+        return {"status": "error", "message": "An error has occurred"}
+
+    print(f"Model Details: {model_details}")
+    # Create or update job
+    if job_id is None:
+        job_id = await db.job_create(type="DOWNLOAD_MODEL", status="STARTED", job_data="{}")
+    else:
+        await db.job_update(job_id=job_id, type="DOWNLOAD_MODEL", status="STARTED")
+
+    model_size = str(model_details.get("size_of_model_in_mb", -1))
+    # Prepare script args
+    args = [
+        f"{dirs.TFL_SOURCE_CODE_DIR}/transformerlab/shared/download_huggingface_model.py",
+        "--mode",
+        "adaptor",
+        "--peft",
+        peft,
+        "--local_model_id",
+        model_id,
+        "--job_id",
+        str(job_id),
+        "--total_size_of_model_in_mb",
+        model_size,
+    ]
+
+    # Start async subprocess without waiting for completion (like download_huggingface_model)
+    asyncio.create_task(
+        shared.async_run_python_script_and_update_status(
+            python_script=args, job_id=job_id, begin_string="Fetching Adapter"
+        )
+    )
+
+    return {"status": "started", "job_id": job_id, "check_status": check_status}
 
 
 @router.get(path="/model/get_local_hfconfig")
@@ -822,3 +1030,17 @@ async def model_import(model: basemodel.BaseModel):
     print(f"{model.id} imported successfully.")
 
     return {"status": "success", "data": model.id}
+
+
+@router.get("/model/chat_template")
+async def chat_template(model_name: str):
+    try:
+        tokenizer = AutoTokenizer.from_pretrained(
+            model_name,
+            trust_remote_code=True,
+        )
+        template = getattr(tokenizer, "chat_template", None)
+        if template:
+            return {"status": "success", "data": template}
+    except Exception:
+        return {"status": "error", "message": f"Invalid model name: {model_name}", "data": None}

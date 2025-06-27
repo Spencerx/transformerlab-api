@@ -29,22 +29,17 @@ from fastapi import BackgroundTasks, FastAPI, Request
 from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import JSONResponse, StreamingResponse
 
-from fastchat.utils import build_logger, get_context_length
+from fastchat.utils import get_context_length
 from huggingface_hub import snapshot_download
 from mlx_embedding_models.embedding import EmbeddingModel
 from mlx_lm import load
 from mlx_lm.generate import generate_step
 from mlx_lm.sample_utils import make_logits_processors, make_sampler
+from transformerlab.plugin import setup_model_worker_logger
 
 worker_id = str(uuid.uuid4())[:8]
-logfile_path = os.path.join(os.environ["_TFL_WORKSPACE_DIR"], "logs")
-if not os.path.exists(logfile_path):
-    os.makedirs(logfile_path)
-logger = build_logger("model_worker", os.path.join(logfile_path, "model_worker.log"))
+logger = setup_model_worker_logger()
 
-import fastchat.serve.base_model_worker  # noqa
-
-fastchat.serve.base_model_worker.logger = logger
 from fastchat.serve.base_model_worker import BaseModelWorker  # noqa
 
 
@@ -66,6 +61,7 @@ class MLXWorker(BaseModelWorker):
         worker_id: str,
         model_path: str,
         model_names: List[str],
+        model_architecture: str,
         limit_worker_concurrency: int,
         no_register: bool,
         conv_template: str,
@@ -83,9 +79,18 @@ class MLXWorker(BaseModelWorker):
         )
 
         logger.info(f"Loading the model {self.model_names} on worker" + f"{worker_id}, worker type: MLX worker...")
+        logger.info(f"Model architecture: {model_architecture}")
 
         self.model_name = model_path
-        self.mlx_model, self.mlx_tokenizer = load(model_path, adapter_path=adaptor_path)
+        # Recommended MLX hack for Qwen models to specify EOS token
+        if "qwen" in model_architecture.lower():
+            self.mlx_model, self.mlx_tokenizer = load(
+                model_path,
+                adapter_path=adaptor_path,
+                tokenizer_config={"eos_token": "<|endoftext|>", "trust_remote_code": True},
+            )
+        else:
+            self.mlx_model, self.mlx_tokenizer = load(model_path, adapter_path=adaptor_path)
 
         self.tokenizer = self.mlx_tokenizer._tokenizer
         self.manual_context_len = context_len
@@ -154,6 +159,7 @@ class MLXWorker(BaseModelWorker):
         temperature = float(params.get("temperature", 1.0))
         top_p = float(params.get("top_p", 1.0))
         top_k = int(params.get("top_k", 10))
+        min_p = float(params.get("min_p", 0.0))  # Add min_p parameter
         # presence_penalty = float(params.get("presence_penalty", 0.0))
         frequency_penalty = float(params.get("frequency_penalty", 0.0))
         max_new_tokens = params.get("max_new_tokens", 256)
@@ -194,10 +200,8 @@ class MLXWorker(BaseModelWorker):
 
         finish_reason = "length"
 
-        # MLX makes you build a sampler to set temperature and top_p
-        # NOTE: We could also pass in top_k and min_p here
-        # but they aren't getting set in UI
-        sampler = make_sampler(temperature, top_p=top_p)
+        # MLX makes you build a sampler to set temperature, top_p, and min_p
+        sampler = make_sampler(temperature, top_p=top_p, min_p=min_p)
 
         logits_processors = make_logits_processors(repetition_penalty=frequency_penalty)
 
@@ -250,11 +254,6 @@ class MLXWorker(BaseModelWorker):
 
             for s in stop:
                 if s in tokens_decoded:
-                    # print("tokens:")
-                    # print(tokens_decoded)
-                    # print("Partial stop found")
-                    # print("stop tokens: ")
-                    # print(stop)
                     partial_stop = True
                     break
 
@@ -399,6 +398,7 @@ async def api_generate_with_visualization(request: Request):
             prompt = params.get("prompt")
             temperature = float(params.get("temperature", 0.7))
             top_p = float(params.get("top_p", 1.0))
+            min_p = float(params.get("min_p", 0.0))  # Expose min_p
             max_new_tokens = int(params.get("max_tokens", 100))
             top_k = int(params.get("top_k", 10))
             frequency_penalty = float(params.get("frequency_penalty", 0.0))
@@ -408,7 +408,7 @@ async def api_generate_with_visualization(request: Request):
             input_tokens = worker.tokenizer.encode(prompt)
 
             # Create sampler with specified parameters
-            sampler = make_sampler(temperature, top_p=top_p)
+            sampler = make_sampler(temperature, top_p=top_p, min_p=min_p)
 
             logits_processors = make_logits_processors(repetition_penalty=frequency_penalty)
 
@@ -899,6 +899,7 @@ def main():
     parser.add_argument("--worker-address", type=str, default="http://localhost:21002")
     parser.add_argument("--controller-address", type=str, default="http://localhost:21001")
     parser.add_argument("--model-path", type=str, default="microsoft/phi-2")
+    parser.add_argument("--model-architecture", type=str, default="MLX")
     parser.add_argument("--adaptor-path", type=str, default=None)
     parser.add_argument(
         "--model-names",
@@ -934,6 +935,7 @@ def main():
         worker_id,
         args.model_path,
         args.model_names,
+        args.model_architecture,
         1024,
         False,
         args.conv_template,

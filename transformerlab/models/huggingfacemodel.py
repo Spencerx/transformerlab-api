@@ -12,7 +12,7 @@ from transformerlab.models import basemodel
 
 import huggingface_hub
 from huggingface_hub.hf_api import RepoFile
-from huggingface_hub import scan_cache_dir
+from huggingface_hub import scan_cache_dir, hf_hub_download
 
 
 async def list_models():
@@ -134,6 +134,59 @@ class HuggingFaceModel(basemodel.BaseModel):
         return detected_formats
 
 
+def _is_gguf_repository(hugging_face_id: str, hf_model_info):
+    """
+    Determine if a repository is primarily a GGUF repository by checking the repository tags for 'gguf'
+    """
+    # Check tags - only consider GGUF if it has gguf tag but not safetensors tag
+    model_tags = getattr(hf_model_info, "tags", [])
+    model_tags_lower = [tag.lower() for tag in model_tags]
+    if "gguf" in model_tags_lower and "safetensors" not in model_tags_lower:
+        return True
+    return False
+
+
+def _create_gguf_repo_config(hugging_face_id: str, hf_model_info, model_card_data):
+    """
+    Create a model config for GGUF repositories that don't have config.json.
+    Returns a special config that indicates available GGUF files for selection.
+    """
+    model_tags = getattr(hf_model_info, "tags", [])
+
+    # Get list of GGUF files in the repository
+    gguf_files = []
+    try:
+        repo_files = huggingface_hub.list_repo_files(hugging_face_id)
+        gguf_files = [f for f in repo_files if f.endswith(".gguf")]
+    except Exception:
+        pass
+
+    # Calculate total repository size
+    try:
+        model_size = get_huggingface_download_size(hugging_face_id) / (1024 * 1024)
+    except Exception:
+        model_size = 0
+
+    config = {
+        "uniqueID": hugging_face_id,
+        "name": getattr(hf_model_info, "modelId", hugging_face_id),
+        "private": getattr(hf_model_info, "private", False),
+        "gated": getattr(hf_model_info, "gated", False),
+        "architecture": "GGUF",
+        "huggingface_repo": hugging_face_id,
+        "model_type": "gguf_repository",
+        "size_of_model_in_mb": model_size,
+        "library_name": "gguf",
+        "tags": model_tags,
+        "license": model_card_data.get("license", ""),
+        "available_gguf_files": gguf_files,
+        "requires_file_selection": True,  # Flag to indicate this needs file selection
+        "context": "",  # Will be determined when specific file is selected
+    }
+
+    return config
+
+
 async def get_model_details_from_huggingface(hugging_face_id: str):
     """
     Gets model config details from huggingface_hub
@@ -143,11 +196,7 @@ async def get_model_details_from_huggingface(hugging_face_id: str):
     This function can raise several Exceptions from HuggingFace
     """
 
-    # Use the Hugging Face Hub API to download the config.json file for this model
-    # This may throw an exception if the model doesn't exist or we don't have access rights
-    huggingface_hub.hf_hub_download(repo_id=hugging_face_id, filename="config.json")
-
-    # Also get model info for metadata and license details
+    # Get model info for metadata and license details
     # Similar to hf_hub_download this can throw exceptions
     # Some models don't have a model card (mostly models that have been deprecated)
     # In that case just set model_card_data to an empty object
@@ -158,11 +207,98 @@ async def get_model_details_from_huggingface(hugging_face_id: str):
     except AttributeError:
         model_card_data = {}
 
-    # Use Hugging Face file system API and let it figure out which file we should be reading
-    fs = huggingface_hub.HfFileSystem()
-    filename = os.path.join(hugging_face_id, "config.json")
-    with fs.open(filename) as f:
-        filedata = json.load(f)
+    # Detect SD model by tags or by presence of model_index.json
+    model_tags = getattr(hf_model_info, "tags", [])
+    is_sd = False
+    if any("stable-diffusion" in t or "diffusers" in t for t in model_tags):
+        is_sd = True
+    try:
+        repo_files = huggingface_hub.list_repo_files(hugging_face_id)
+        if any(f.endswith("model_index.json") for f in repo_files):
+            is_sd = True
+    except Exception:
+        repo_files = []
+
+    sd_patterns = [
+        "*.ckpt",
+        "*.safetensors",
+        "*.pt",
+        "*.bin",
+        "config.json",
+        "model_index.json",
+        "vocab.json",
+        "merges.txt",
+        "tokenizer.json",
+        "*.yaml",
+        "*.yml",
+    ]
+
+    if is_sd:
+        # Try to read model_index.json for metadata, else just return minimal config
+        model_index_path = os.path.join(hugging_face_id, "model_index.json")
+        fs = huggingface_hub.HfFileSystem()
+        model_index = None
+
+        try:
+            with fs.open(model_index_path) as f:
+                model_index = json.load(f)
+                class_name = model_index.get("_class_name", "")
+                if class_name == "":
+                    config = getattr(model_index, "config", {})
+                    diffusers_config = config.get("diffusers", {})
+                    architectures = diffusers_config.get("_class_name", "")
+                    if isinstance(architectures, str):
+                        architectures = [architectures]
+                else:
+                    if isinstance(class_name, str):
+                        architectures = [class_name]
+                    else:
+                        architectures = class_name
+        except Exception:
+            try:
+                config_path = hf_hub_download(hugging_face_id, filename="config.json")
+                with open(config_path) as f:
+                    model_index = json.load(f)
+                    class_name = model_index.get("_class_name")
+                    if class_name:
+                        if isinstance(class_name, str):
+                            architectures = [class_name]
+                        else:
+                            architectures = class_name
+                    else:
+                        architectures = ["UnknownDiffusionModel"]
+            except Exception:
+                model_index = None
+                architectures = ["UnknownDiffusionModel"]
+        config = {
+            "uniqueID": hugging_face_id,
+            "name": getattr(hf_model_info, "modelId", hugging_face_id),
+            "private": getattr(hf_model_info, "private", False),
+            "gated": getattr(hf_model_info, "gated", False),
+            "architecture": architectures[0],
+            "huggingface_repo": hugging_face_id,
+            "model_type": "diffusion",
+            "size_of_model_in_mb": get_huggingface_download_size(hugging_face_id, sd_patterns) / (1024 * 1024),
+            "tags": model_tags,
+            "license": model_card_data.get("license", ""),
+            "allow_patterns": sd_patterns,
+        }
+        if model_index:
+            config["model_index"] = model_index
+        return config
+
+    # Check if this is a GGUF repository first, before processing config.json
+    is_gguf_repo = _is_gguf_repository(hugging_face_id, hf_model_info)
+    if is_gguf_repo:
+        return _create_gguf_repo_config(hugging_face_id, hf_model_info, model_card_data)
+
+    # Try to download config.json for non-GGUF repositories
+    try:
+        huggingface_hub.hf_hub_download(repo_id=hugging_face_id, filename="config.json")
+        fs = huggingface_hub.HfFileSystem()
+        filename = os.path.join(hugging_face_id, "config.json")
+        with fs.open(filename) as f:
+            filedata = json.load(f)
 
         # config.json stores a list of architectures but we only store one so just take the first!
         architecture_list = filedata.get("architectures", [])
@@ -188,6 +324,32 @@ async def get_model_details_from_huggingface(hugging_face_id: str):
         # TODO: Context length definition seems to vary by architecture. May need conditional logic here.
         context_size = filedata.get("max_position_embeddings", "")
 
+        # --- Stable Diffusion detection and allow_patterns logic ---
+        sd_patterns = [
+            "*.ckpt",
+            "*.safetensors",
+            "*.pt",
+            "*.bin",
+            "config.json",
+            "model_index.json",
+            "vocab.json",
+            "merges.txt",
+            "tokenizer.json",
+            "*.yaml",
+            "*.yml",
+        ]
+        is_sd = False
+        # Heuristic: check tags or config for 'stable-diffusion' or 'diffusers' or common SD files
+        if any("stable-diffusion" in t or "diffusers" in t for t in model_tags):
+            is_sd = True
+        # Or check for model_index.json in repo files
+        try:
+            repo_files = huggingface_hub.list_repo_files(hugging_face_id)
+            if any(f.endswith("model_index.json") for f in repo_files):
+                is_sd = True
+        except Exception:
+            pass
+
         # TODO: Figure out description, paramters, model size
         newmodel = basemodel.BaseModel(hugging_face_id)
         config = await newmodel.get_json_data()
@@ -208,6 +370,21 @@ async def get_model_details_from_huggingface(hugging_face_id: str):
             "license": model_card_data.get("license", ""),
         }
         return config
+    except huggingface_hub.utils.EntryNotFoundError as e:
+        print(f"ERROR: config.json not found for {hugging_face_id}: {e}")
+        raise
+    except huggingface_hub.utils.GatedRepoError as e:
+        print(f"ERROR: Model {hugging_face_id} is gated and requires authentication: {e}")
+        raise
+    except huggingface_hub.utils.RepositoryNotFoundError as e:
+        print(f"ERROR: Repository {hugging_face_id} not found: {e}")
+        raise
+    except json.JSONDecodeError as e:
+        print(f"ERROR: Invalid JSON in config.json for {hugging_face_id}: {e}")
+        raise
+    except Exception as e:
+        print(f"ERROR: Unexpected error processing {hugging_face_id}: {type(e).__name__}: {e}")
+        raise
 
     # Something did not go to plan
     return None
@@ -221,7 +398,7 @@ def get_huggingface_download_size(model_id: str, allow_patterns: list = []):
     """
 
     # This can throw Exceptions: RepositoryNotFoundError
-    hf_model_info = huggingface_hub.list_repo_tree(model_id)
+    hf_model_info = huggingface_hub.list_repo_tree(model_id, recursive=True)
 
     # Iterate over files in the model repo and add up size if they are included in download
     download_size = 0
